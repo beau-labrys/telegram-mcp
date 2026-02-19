@@ -34,8 +34,74 @@ from telethon.tl.types import (
     InputPeerChannel,
 )
 import re
+import secrets
 from functools import wraps
 import telethon.errors.rpcerrorlist
+
+
+# Security: Allowed base directory for file operations (path traversal prevention)
+_ALLOWED_FILE_BASE = os.path.realpath(os.path.expanduser("~"))
+
+# Security: Deny-list of sensitive directories and files within home directory
+_DENIED_PATHS = [
+    ".ssh",
+    ".gnupg",
+    ".gpg",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".kube",
+    ".docker",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".git-credentials",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    ".bash_history",
+    ".zsh_history",
+    ".node_repl_history",
+    ".python_history",
+    ".lesshst",
+    ".mysql_history",
+    ".psql_history",
+    "credentials.json",
+    "token.json",
+    ".claude",
+]
+_DENIED_ABSOLUTE = [
+    os.path.join(_ALLOWED_FILE_BASE, p) for p in _DENIED_PATHS
+]
+
+
+def validate_file_path(file_path: str) -> str:
+    """
+    Validate that a file path is within the user's home directory and not
+    in a sensitive location.
+
+    Resolves symlinks, rejects paths outside the home directory, and blocks
+    access to known sensitive files/directories (SSH keys, credentials, etc.)
+    to prevent exfiltration via prompt injection.
+
+    Args:
+        file_path: The file path to validate.
+
+    Returns:
+        The resolved absolute path.
+
+    Raises:
+        ValueError: If the path is outside the allowed directory or in a
+            denied sensitive location.
+    """
+    resolved = os.path.realpath(file_path)
+    if not resolved.startswith(_ALLOWED_FILE_BASE + os.sep) and resolved != _ALLOWED_FILE_BASE:
+        raise ValueError("File path is outside the allowed directory")
+    for denied in _DENIED_ABSOLUTE:
+        if resolved == denied or resolved.startswith(denied + os.sep):
+            raise ValueError("Access to sensitive files is not allowed")
+    return resolved
 
 
 class ValidationError(Exception):
@@ -340,9 +406,10 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
     Get a paginated list of chats.
     Args:
         page: Page number (1-indexed).
-        page_size: Number of chats per page.
+        page_size: Number of chats per page (max 100).
     """
     try:
+        page_size = min(page_size, 100)
         dialogs = await client.get_dialogs()
         start = (page - 1) * page_size
         end = start + page_size
@@ -368,9 +435,10 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     Args:
         chat_id: The ID or username of the chat.
         page: Page number (1-indexed).
-        page_size: Number of messages per page.
+        page_size: Number of messages per page (max 100).
     """
     try:
+        page_size = min(page_size, 100)
         entity = await client.get_entity(chat_id)
         offset = (page - 1) * page_size
         messages = await client.get_messages(entity, limit=page_size, add_offset=offset)
@@ -842,11 +910,12 @@ async def list_topics(
 
     Args:
         chat_id: The ID of the forum-enabled chat (supergroup).
-        limit: Maximum number of topics to retrieve.
+        limit: Maximum number of topics to retrieve (max 500).
         offset_topic: Topic ID offset for pagination.
         search_query: Optional query to filter topics by title.
     """
     try:
+        limit = min(limit, 500)
         entity = await client.get_entity(chat_id)
 
         if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
@@ -921,9 +990,10 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
 
     Args:
         chat_type: Filter by chat type ('user', 'group', 'channel', or None for all)
-        limit: Maximum number of chats to retrieve.
+        limit: Maximum number of chats to retrieve (max 500).
     """
     try:
+        limit = min(limit, 500)
         dialogs = await client.get_dialogs(limit=limit)
 
         results = []
@@ -1170,7 +1240,7 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
                 chat_type = "Channel" if getattr(chat, "broadcast", False) else "Group"
                 chat_info = f"Chat ID: {chat.id}, Title: {chat.title}, Type: {chat_type}"
                 results.append(chat_info)
-        except:
+        except Exception:
             results.append("Could not retrieve common groups.")
 
         if not results:
@@ -1235,9 +1305,10 @@ async def get_message_context(
     Args:
         chat_id: The ID or username of the chat.
         message_id: The ID of the central message.
-        context_size: Number of messages before and after to include.
+        context_size: Number of messages before and after to include (max 50).
     """
     try:
+        context_size = min(context_size, 50)
         chat = await client.get_entity(chat_id)
         # Get messages around the specified message
         messages_before = await client.get_messages(chat, limit=context_size, max_id=message_id)
@@ -1344,11 +1415,13 @@ async def add_contact(phone: str, first_name: str, last_name: str = "") -> str:
             else:
                 return f"Contact not added. Alternative method response: {str(result)}"
         except Exception as alt_e:
-            logger.exception(f"add_contact (alt method) failed (phone={phone})")
-            return log_and_format_error("add_contact", alt_e, phone=phone)
+            redacted_phone = "***" + phone[-4:] if len(phone) >= 4 else "***"
+            logger.exception(f"add_contact (alt method) failed (phone={redacted_phone})")
+            return log_and_format_error("add_contact", alt_e)
     except Exception as e:
-        logger.exception(f"add_contact failed (phone={phone})")
-        return log_and_format_error("add_contact", e, phone=phone)
+        redacted_phone = "***" + phone[-4:] if len(phone) >= 4 else "***"
+        logger.exception(f"add_contact failed (phone={redacted_phone})")
+        return log_and_format_error("add_contact", e)
 
 
 @mcp.tool(
@@ -1655,6 +1728,10 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
         caption: Optional caption for the file.
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         if not os.path.isfile(file_path):
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
@@ -1681,6 +1758,10 @@ async def download_media(chat_id: Union[int, str], message_id: int, file_path: s
         file_path: Absolute path to save the downloaded file (must be writable).
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         entity = await client.get_entity(chat_id)
         msg = await client.get_messages(entity, ids=message_id)
         if not msg or not msg.media:
@@ -1735,6 +1816,10 @@ async def set_profile_photo(file_path: str) -> str:
     Set a new profile photo.
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         await client(
             functions.photos.UploadProfilePhotoRequest(file=await client.upload_file(file_path))
         )
@@ -1998,6 +2083,10 @@ async def edit_chat_photo(chat_id: Union[int, str], file_path: str) -> str:
     Edit the photo of a chat, group, or channel. Requires a file path to an image.
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         if not os.path.isfile(file_path):
             return f"Photo file not found: {file_path}"
         if not os.access(file_path, os.R_OK):
@@ -2416,7 +2505,8 @@ async def join_chat_by_link(link: str) -> str:
             return "The invite hash is invalid or malformed."
         elif "already" in err_str and "participant" in err_str:
             return "You are already a member of this chat."
-        logger.exception(f"join_chat_by_link failed (link={link})")
+        redacted_link = link[:4] + "..." if len(link) > 4 else "***"
+        logger.exception(f"join_chat_by_link failed (link={redacted_link})")
         return f"Error joining chat: {e}"
 
 
@@ -2514,8 +2604,9 @@ async def import_chat_invite(hash: str) -> str:
                 raise  # Re-raise to be caught by the outer exception handler
 
     except Exception as e:
-        logger.exception(f"import_chat_invite failed (hash={hash})")
-        return log_and_format_error("import_chat_invite", e, hash=hash)
+        redacted_hash = hash[:4] + "..." if len(hash) > 4 else "***"
+        logger.exception(f"import_chat_invite failed (hash={redacted_hash})")
+        return log_and_format_error("import_chat_invite", e)
 
 
 @mcp.tool(
@@ -2531,6 +2622,10 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
         file_path: Absolute path to the OGG/OPUS file.
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         if not os.path.isfile(file_path):
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
@@ -2736,6 +2831,7 @@ async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20)
     Search for messages in a chat by text.
     """
     try:
+        limit = min(limit, 500)
         entity = await client.get_entity(chat_id)
         messages = await client.get_messages(entity, limit=limit, search=query)
 
@@ -2924,6 +3020,10 @@ async def send_sticker(chat_id: Union[int, str], file_path: str) -> str:
         file_path: Absolute path to the .webp sticker file.
     """
     try:
+        try:
+            file_path = validate_file_path(file_path)
+        except ValueError:
+            return "File path is outside the allowed directory."
         if not os.path.isfile(file_path):
             return f"Sticker file not found: {file_path}"
         if not os.access(file_path, os.R_OK):
@@ -2947,9 +3047,10 @@ async def get_gif_search(query: str, limit: int = 10) -> str:
 
     Args:
         query: Search term for GIFs.
-        limit: Max number of GIFs to return.
+        limit: Max number of GIFs to return (max 500).
     """
     try:
+        limit = min(limit, 500)
         # Try approach 1: SearchGifsRequest
         try:
             result = await client(
@@ -3107,9 +3208,10 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 @validate_id("chat_id")
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
-    Get full chat history (up to limit).
+    Get full chat history (up to limit, max 500).
     """
     try:
+        limit = min(limit, 500)
         entity = await client.get_entity(chat_id)
         messages = await client.get_messages(entity, limit=limit)
 
@@ -3136,6 +3238,7 @@ async def get_user_photos(user_id: Union[int, str], limit: int = 10) -> str:
     Get profile photos of a user.
     """
     try:
+        limit = min(limit, 500)
         user = await client.get_entity(user_id)
         photos = await client(
             functions.photos.GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=limit)
@@ -3275,10 +3378,9 @@ async def create_poll(
 
         # Create the poll using InputMediaPoll with SendMediaRequest
         from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
-        import random
 
         poll = Poll(
-            id=random.randint(0, 2**63 - 1),
+            id=secrets.randbelow(2**63),
             question=TextWithEntities(text=question, entities=[]),
             answers=[
                 PollAnswer(text=TextWithEntities(text=option, entities=[]), option=bytes([i]))
@@ -3295,7 +3397,7 @@ async def create_poll(
                 peer=entity,
                 media=InputMediaPoll(poll=poll),
                 message="",
-                random_id=random.randint(0, 2**63 - 1),
+                random_id=secrets.randbelow(2**63),
             )
         )
 
